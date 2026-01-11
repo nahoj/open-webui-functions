@@ -1,6 +1,6 @@
 """
 title: Global System Prompt
-description: Injects a default system prompt unless the model has specific tags.
+description: Inject a system prompt into all conversations unless the model has specific tags.
 author: Johan Grande
 repository: https://github.com/nahoj/open-webui-functions
 version: 1.0
@@ -19,7 +19,7 @@ class Filter:
     class Valves(BaseModel):
         system_prompt: str = Field(
             default="",
-            description="The system prompt to inject by default",
+            description="The system prompt to inject",
         )
         skip_tags: List[str] = Field(
             default=["tag1", "tag2"],
