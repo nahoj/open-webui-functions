@@ -2,9 +2,9 @@
 title: Global System Prompt
 author: Johan Grande
 repository: https://github.com/nahoj/open-webui-functions
-version: 1.1
+version: 2.0
 license: MIT
-description: Inject a system prompt into all chats unless the model has specific tags.
+description: Inject a system prompt into all chats, filtering on model tags. The filter can also be manually added to individual models.
 """
 
 import logging
@@ -28,16 +28,20 @@ class Filter:
             default="",
             description="The system prompt to inject",
         )
-        SKIP_TAGS: List[str] = Field(
-            default=["tag1", "tag2"],
-            description="List of model tags that opt out of the global prompt",
+        INCLUDE_TAGS: List[str] = Field(
+            default=[],
+            description="If non-empty, only apply the prompt to models having at least one of these tags",
+        )
+        EXCLUDE_TAGS: List[str] = Field(
+            default=["exclude_tag_1", "exclude_tag_2"],
+            description="Never apply the prompt to models having at least one of these tags (takes precedence over INCLUDE_TAGS)",
         )
         APPEND_DATE: bool = Field(
             default=True,
             description="Append the current date to the system prompt",
         )
         priority: int = Field(
-            default=10,
+            default=-10,
             description="Filter priority (lower runs first, OWUI default = 0)",
         )
 
@@ -59,9 +63,14 @@ class Filter:
         if not self.valves.SYSTEM_PROMPT:
             return body
 
-        model_tags = _safe_get(__model__, ["info", "meta", "tags"], [])
+        model_tag_names = _safe_get(__model__, ["info", "meta", "tags", "name"], [])
 
-        if any(_safe_get(tag, ["name"], "") in self.valves.SKIP_TAGS for tag in model_tags):
+        if any(tag_name in self.valves.EXCLUDE_TAGS for tag_name in model_tag_names):
+            return body
+
+        if self.valves.INCLUDE_TAGS and not any(
+            tag_name in self.valves.INCLUDE_TAGS for tag_name in model_tag_names
+        ):
             return body
 
         prompt = self.valves.SYSTEM_PROMPT + "\n"
