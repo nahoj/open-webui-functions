@@ -8,8 +8,10 @@ description: Inject a system prompt into all chats unless the model has specific
 """
 
 import logging
+from datetime import datetime
 from functools import reduce
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
@@ -30,8 +32,12 @@ class Filter:
             default=["tag1", "tag2"],
             description="List of model tags that opt out of the global prompt",
         )
-        PRIORITY: int = Field(
-            default=-1,
+        APPEND_DATE: bool = Field(
+            default=True,
+            description="Append the current date to the system prompt",
+        )
+        priority: int = Field(
+            default=10,
             description="Filter priority (lower runs first, OWUI default = 0)",
         )
 
@@ -58,8 +64,13 @@ class Filter:
         if any(_safe_get(tag, ["name"], "") in self.valves.SKIP_TAGS for tag in model_tags):
             return body
 
+        prompt = self.valves.SYSTEM_PROMPT + "\n"
+        if self.valves.APPEND_DATE:
+            today = datetime.now(tz=ZoneInfo(__user__["timezone"] or "UTC")).date()
+            prompt = f"{prompt}\nCurrent date: {today.strftime('%A %Y-%m-%d')}\n"
         body["messages"] = add_or_update_system_message(
-            self.valves.SYSTEM_PROMPT,
+            prompt,
             body.get("messages", []),
+            append=False,
         )
         return body
