@@ -1,4 +1,12 @@
-This repository contains Functions, i.e., plugins, for [Open WebUI](https://github.com/open-webui/open-webui).
+This repository contains plugins for [Open WebUI](https://github.com/open-webui/open-webui).
+
+## Auto-Export Chats
+
+A background job that periodically exports chats to Markdown files.
+- Supports folders, tags, opt-in per user.
+- 2 action buttons for manual control.
+
+**Example use cases:** Read your chats in a notes app such as Nextcloud Notes or Obsidian, gather chats from multiple apps, backup.
 
 ## Global System Prompt
 
