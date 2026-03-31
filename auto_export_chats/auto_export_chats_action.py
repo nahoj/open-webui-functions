@@ -61,44 +61,6 @@ def _truncate_utf8(string: str, max_bytes: int) -> str:
     return string.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
 
 
-class _JsLogHandler(logging.Handler):
-    def __init__(self, plugin) -> None:
-        super().__init__()
-        self.plugin = plugin
-
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            record_message = record.getMessage()
-            group = (
-                f"🛠 {record.name} 🛠 "
-                f"{record_message if len(record_message) < 80 else record_message[:80]}"
-            )
-            method = {
-                "NOTSET": "log",
-                "DEBUG": "debug",
-                "INFO": "info",
-                "WARNING": "warn",
-                "ERROR": "error",
-                "FATAL": "error",
-                "CRITICAL": "error",
-            }.get(record.levelname, "log")
-            js_code = f"""
-                    (async function() {{
-                        console.groupCollapsed({json.dumps(group, ensure_ascii=False)});
-                        console.{method}({json.dumps(self.format(record), ensure_ascii=False)});
-                        console.groupEnd();
-                    }})();
-                """
-            if self.plugin.event_emitter:
-                asyncio.create_task(
-                    self.plugin.event_emitter(
-                        {"type": "execute", "data": {"code": js_code}}
-                    )
-                )
-        except Exception as exc:  # pragma: no cover - best-effort logging
-            self.plugin.logger.debug("Error emitting JS log: %s", exc)
-
-
 # ---------------------------------------------------------------------------
 # Per-user change-detection snapshots
 # ---------------------------------------------------------------------------
@@ -159,11 +121,6 @@ class Action:
         # Logging
         self.logger = logging.getLogger("auto_export_chats")
         self.logger.setLevel(logging.DEBUG)
-        for handler in list(self.logger.handlers):
-            if handler.__class__.__name__ == _JsLogHandler.__name__:
-                self.logger.removeHandler(handler)
-        self.logger.addHandler(_JsLogHandler(self))
-        self.event_emitter = None
 
         self._function_id = os.path.basename(os.path.dirname(__file__))
         self._run_lock = threading.Lock()
@@ -783,8 +740,6 @@ class Action:
         __request__=None,
         __event_emitter__=None,
     ):
-        self.event_emitter = __event_emitter__
-
         self._sync_runtime_valves()
         user_id = str((__user__ or {}).get("id", ""))
         if not user_id:
