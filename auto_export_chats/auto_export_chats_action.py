@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 FUNCTION_ID = "auto_export_chats" # Set to the actual value
 
 """
@@ -22,133 +24,162 @@ as long as the main toggle for this function is on.
 """
 
 import asyncio
-import datetime
 import json
 import logging
 import os
 import re
 import uuid
-
 import aiofiles
 import aiofiles.os
+
 from anyio import Path as AnyPath
+from datetime import datetime, timezone, tzinfo
 from typing import Any, Dict, List, Optional, Set
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field
 
 from open_webui.internal.db import get_db_context
 from open_webui.models.chats import Chat, Chats
 from open_webui.models.folders import Folder
-from open_webui.models.users import Users
+from open_webui.models.users import UserModel, Users
 
 
 log = logging.getLogger("auto_export_chats")
 log.setLevel(logging.DEBUG)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════════
+# Action
+# ═══════════════════════════════════════════════════════════════════════════════
 
+class Action:
+    actions = [
+        {"id": "run_now", "name": "Run Auto-Export Now"},
+    ]
 
-def _sanitize_filename(text: str) -> str:
-    """Removes characters that are invalid for file names."""
-    text = text.strip()
-    text = _truncate_utf8(text, 100)
-    text = "".join(ch if ch.isprintable() else "-" for ch in text)
-    text = re.sub(r'[<>:"/\\|?*]', "-", text)
-    text = text.replace(" ", "_")
-    if not text:
-        return "Untitled"
-    return text
-
-
-def _truncate_utf8(string: str, max_bytes: int) -> str:
-    """Truncates a UTF-8 string to a maximum number of bytes without creating invalid characters."""
-    return string.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")
-
-
-async def _get_user_timezone(user_id: Optional[str]) -> datetime.tzinfo:
-    if user_id:
-        try:
-            user = await asyncio.to_thread(Users.get_user_by_id, user_id)
-            timezone_name = getattr(user, "timezone", None) if user else None
-            if timezone_name:
-                return ZoneInfo(timezone_name)
-        except ZoneInfoNotFoundError:
-            log.warning(f"Unknown timezone for user {user_id}; falling back to UTC")
-        except Exception:
-            log.warning(f"Error resolving timezone for user {user_id}; falling back to UTC", exc_info=True)
-    return datetime.timezone.utc
-
-
-# ---------------------------------------------------------------------------
-# Per-user change-detection snapshots
-# ---------------------------------------------------------------------------
-
-
-class _FolderSnapshot:
-    __slots__ = ("updated_at", "name", "parent_id")
-
-    def __init__(self, updated_at: int, name: str, parent_id: Optional[str]):
-        self.updated_at = updated_at
-        self.name = name
-        self.parent_id = parent_id
-
-    def differs(self, other: "_FolderSnapshot") -> bool:
-        return (
-            self.updated_at != other.updated_at
-            or self.name != other.name
-            or self.parent_id != other.parent_id
+    class Valves(BaseModel):
+        POLL_INTERVAL_SECONDS: int = Field(
+            default=300,
+            description="How often to check for changes (seconds). Set to 0 to disable background auto-run. Default: 5 minutes.",
+        )
+        OPEN_WEBUI_BASE_URL: str = Field(
+            default="",
+            description="Base URL of the Open WebUI instance (e.g., https://your.domain), for Markdown frontmatter link.",
+        )
+        EXPORT_DIR: str = Field(
+            default="/app/backend/data/Chats",
+            description="Root directory under which user chats will be saved.",
         )
 
+    class UserValves(BaseModel):
+        ENABLED: bool = Field(
+            default=False,
+            description="Enable chat auto-export for this user.",
+        )
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# _ExportWorker
-# ═══════════════════════════════════════════════════════════════════════════════
-# Lifecycle: When OWUI drops the Action instance, ref count → 0. The _worker
-# is in an isolated cycle (worker ↔ task), so cyclic GC calls __del__ →
-# task.cancel(). Delay of a few seconds is acceptable.
+    def __init__(self):
+        self.valves = self.Valves()
 
+        if int(self.valves.POLL_INTERVAL_SECONDS) > 0:
+            self._worker = ExportWorker(self.valves)
+        else:
+            self._worker = None
 
-class _ExportWorker:
-    def __init__(self, valves, function_id: str):
-        self.valves = valves
-        self.function_id = function_id
-        self._task = asyncio.get_running_loop().create_task(self._run())
+        log.info(
+            f"Auto-Export Chats initialized (polling every {self.valves.POLL_INTERVAL_SECONDS}s). "
+            f"Saving to: {os.path.abspath(self.valves.EXPORT_DIR)}"
+        )
 
     def __del__(self):
+        if self._worker:
+            self._worker.cancel()
+
+    @staticmethod
+    async def _emit_status(__event_emitter__, description: str, done: bool = True):
+        if __event_emitter__ is not None:
+            await __event_emitter__(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                    },
+                }
+            )
+
+    async def action(
+        self,
+        body: dict,
+        __user__: Optional[dict] = None,
+        __id__: Optional[str] = None,
+        __request__=None,
+        __event_emitter__=None,
+    ):
+        user_id = str((__user__ or {}).get("id", ""))
+        if not user_id:
+            await self._emit_status(__event_emitter__, "Auto-export requires a logged-in user.")
+            return body
+
+        # if __id__ == "run_now":
+        #     if self._worker is None:
+        #         # Create a temporary worker for one-off execution
+        #         worker = ExportWorker(self.valves)
+        #         result = await worker.run_export_job()
+        #     else:
+        #         result = await self._worker.run_export_job()
+        #     if result == "success":
+        #         await self._emit_status(__event_emitter__, "Auto-export run completed.")
+        #     else:
+        #         await self._emit_status(__event_emitter__, "Auto-export run failed.")
+        #     return body
+
+        await self._emit_status(__event_emitter__, "Unknown auto-export action.")
+        return body
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ExportWorker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ExportWorker:
+    def __init__(self, valves):
+        self.valves = valves
+        self._task = asyncio.get_running_loop().create_task(self._run())
+
+    def cancel(self):
         self._task.cancel()
 
     async def _run(self):
         try:
             while True:
                 await asyncio.sleep(self.valves.POLL_INTERVAL_SECONDS)
-                await self.run_export_job()
+                await AllUserExport.run(self.valves)
         except asyncio.CancelledError:
             pass
 
-    # ------------------------------------------------------------------
-    # Export job orchestration
-    # ------------------------------------------------------------------
 
-    async def run_export_job(self) -> str:
+# ═══════════════════════════════════════════════════════════════════════════════
+# AllUserExport
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class AllUserExport:
+
+    @staticmethod
+    async def run(valves: Action.Valves) -> str:
         try:
-            job_started_at = datetime.datetime.now(datetime.timezone.utc)
-            user_ids = await self._get_enabled_user_ids()
+            job_started_at = datetime.now(timezone.utc)
+            user_ids = await AllUserExport._get_enabled_user_ids()
             log.info(f"Starting export job for {len(user_ids)} user(s): {user_ids}")
             for user_id in user_ids:
-                await SingleUserExport.export_user(user_id, job_started_at, self.valves)
+                await SingleUserExport.export_user(user_id, job_started_at, valves)
             return "success"
         except Exception:
             log.error(f"Error running chat export", exc_info=True)
             return "failed"
 
-    async def _get_enabled_user_ids(self) -> Set[str]:
-        if not self.function_id:
-            return set()
-
+    @staticmethod
+    async def _get_enabled_user_ids() -> Set[str]:
         try:
             result = await asyncio.to_thread(lambda: Users.get_users(limit=None))
             if isinstance(result, dict):
@@ -171,14 +202,38 @@ class _ExportWorker:
             if (
                 settings.get("functions", {})
                 .get("valves", {})
-                .get(self.function_id, {})
+                .get(FUNCTION_ID, {})
                 .get("ENABLED")
             ):
                 enabled_user_ids.add(user.id)
         return enabled_user_ids
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SingleUserExport
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class SingleUserExport:
+
+    @staticmethod
+    async def export_user(user_id: str, job_started_at: datetime, valves: Action.Valves):
+        user = await asyncio.to_thread(Users.get_user_by_id, user_id)
+
+        user_export_dir = os.path.join(valves.EXPORT_DIR, _sanitize_filename(user.name))
+        last_successful_export_at = await SingleUserExport._read_last_successful_export_at(user_export_dir)
+        log.info(f"User {user_id}: root_dir={user_export_dir}, last_successful_export_at={last_successful_export_at}")
+
+        cur_folders = await SingleUserExport._query_folders(user_id)
+        # log.info(f"User {user_id}: {len(cur_folders)} folder(s) in DB")
+        folder_path_map = FolderExport.build_folder_path_map(cur_folders)
+        # log.debug(f"User {user_id}: folder_path_map={folder_path_map}")
+        await SingleUserExport._cleanup_orphaned_folder_markers(user_export_dir, set(cur_folders.keys()))
+        await FolderExport.reconcile_user_folders(user_export_dir, cur_folders, folder_path_map)
+
+        await ChatExport.export_chats(user, user_export_dir, folder_path_map, last_successful_export_at,
+                                      valves.OPEN_WEBUI_BASE_URL)
+
+        await SingleUserExport._write_state(user_export_dir, job_started_at)
 
     @staticmethod
     def _state_file_path(user_export_dir: str) -> str:
@@ -198,52 +253,31 @@ class SingleUserExport:
         return data if isinstance(data, dict) else {}
 
     @staticmethod
-    async def _read_last_successful_export_at(user_export_dir: str) -> Optional[datetime.datetime]:
+    async def _read_last_successful_export_at(user_export_dir: str) -> Optional[datetime]:
         data = await SingleUserExport._read_state(user_export_dir)
 
         value = data.get("last_successful_export_at") if isinstance(data, dict) else None
         if not value:
             return None
         try:
-            parsed = datetime.datetime.fromisoformat(value)
+            parsed = datetime.fromisoformat(value)
         except ValueError:
             log.warning("Invalid last_successful_export_at in auto-export state file")
             return None
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
 
     @staticmethod
-    async def _write_state(user_export_dir: str, job_started_at: datetime.datetime):
+    async def _write_state(user_export_dir: str, job_started_at: datetime):
         await aiofiles.os.makedirs(user_export_dir, exist_ok=True)
         content = json.dumps({"last_successful_export_at": job_started_at.isoformat()}, indent=2) + "\n"
         async with aiofiles.open(SingleUserExport._state_file_path(user_export_dir), "w", encoding="utf-8") as f:
             await f.write(content)
 
     @staticmethod
-    async def export_user(user_id: str, job_started_at: datetime.datetime, valves: "Action.Valves"):
-        user_export_dir = await FolderExport.get_user_export_dir(valves.EXPORT_DIR, user_id)
-        last_successful_export_at = await SingleUserExport._read_last_successful_export_at(user_export_dir)
-        log.info(f"User {user_id}: root_dir={user_export_dir}, last_successful_export_at={last_successful_export_at}")
-
-        cur_folders = await SingleUserExport._query_folders(user_id)
-        # log.info(f"User {user_id}: {len(cur_folders)} folder(s) in DB")
-        folder_path_map = FolderExport.build_folder_path_map(cur_folders)
-        # log.debug(f"User {user_id}: folder_path_map={folder_path_map}")
-        await SingleUserExport._cleanup_orphaned_folder_markers(user_export_dir, set(cur_folders.keys()))
-        await FolderExport.reconcile_user_folders(user_export_dir, cur_folders, folder_path_map)
-
-        await ChatExport.export_chats(valves.OPEN_WEBUI_BASE_URL, folder_path_map, last_successful_export_at, user_export_dir, user_id)
-
-        await SingleUserExport._write_state(user_export_dir, job_started_at)
-
-    # ------------------------------------------------------------------
-    # Lightweight DB queries (no chat JSON blob)
-    # ------------------------------------------------------------------
-
-    @staticmethod
     async def _query_folders(user_id: str) -> Dict[str, _FolderSnapshot]:
-        """Returns {folder_id: _FolderSnapshot}."""
+        """Returns {folder_id: _FolderSnapshot}. Lightweight DB query (no chat JSON blob)."""
         def _sync():
             with get_db_context() as db:
                 rows = (
@@ -273,6 +307,10 @@ class SingleUserExport:
                     pass
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# FolderExport
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class FolderExport:
 
     @staticmethod
@@ -298,11 +336,6 @@ class FolderExport:
         for fid in folders:
             _resolve(fid)
         return cache
-
-    @staticmethod
-    async def get_user_export_dir(root_export_dir: str, user_id: str) -> str:
-        user = await asyncio.to_thread(Users.get_user_by_id, user_id)
-        return os.path.join(root_export_dir, _sanitize_filename(user.name))
 
     @staticmethod
     def _folder_id_file_name(folder_id: str) -> str:
@@ -482,21 +515,25 @@ class FolderExport:
                 raise RuntimeError(f"Could not reconcile folder layout for user root {user_export_dir}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ChatExport
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class ChatExport:
 
     @staticmethod
     async def export_chats(
-        open_webui_base_url,
+        user: UserModel,
+        user_export_dir: str,
         folder_path_map: dict[str, str],
         last_successful_export_at: Optional[datetime],
-        user_export_dir: str,
-        user_id: str
+        open_webui_base_url: str
     ):
-        chats_to_export_ids = await ChatExport._query_chat_ids_to_export(user_id, last_successful_export_at)
-        log.info(f"User {user_id}: {len(chats_to_export_ids)} chat(s) to export")
-        user_tz = await _get_user_timezone(user_id)
+        chats_to_export_ids = await ChatExport._query_chat_ids_to_export(user.id, last_successful_export_at)
+        log.info(f"User {user.name}: {len(chats_to_export_ids)} chat(s) to export")
+        user_tz = ZoneInfo(user.timezone or "UTC")
         for i, chat_id in enumerate(chats_to_export_ids, 1):
-            log.debug(f"User {user_id}: exporting chat {i}/{len(chats_to_export_ids)}: {chat_id}")
+            log.debug(f"User {user.name}: exporting chat {i}/{len(chats_to_export_ids)}: {chat_id}")
             chat = await asyncio.to_thread(Chats.get_chat_by_id, chat_id)
             if chat:
                 await ChatExport._export_chat(open_webui_base_url, chat, folder_path_map, user_export_dir, user_tz)
@@ -505,13 +542,13 @@ class ChatExport:
 
         if chats_to_export_ids:
             log.info(
-                f"User {user_id}: exported {len(chats_to_export_ids)} since {last_successful_export_at.isoformat() if last_successful_export_at else 'beginning'} "
+                f"User {user.name}: exported {len(chats_to_export_ids)} since {last_successful_export_at.isoformat() if last_successful_export_at else 'beginning'} "
             )
 
     @staticmethod
     async def _query_chat_ids_to_export(
         user_id: str,
-        last_successful_export_at: Optional[datetime.datetime],
+        last_successful_export_at: Optional[datetime],
     ) -> List[str]:
         def _sync():
             with get_db_context() as db:
@@ -555,7 +592,7 @@ class ChatExport:
         chat,
         folder_path_map: Dict[str, str],
         user_export_dir: str,
-        user_tz: datetime.tzinfo,
+        user_tz: tzinfo,
     ):
         short_id = chat.id[-12:]
         display_title = chat.title or "Untitled Conversation"
@@ -608,16 +645,16 @@ class ChatExport:
         log.debug(f"Exported chat to {file_path}")
 
     @staticmethod
-    def _get_chat_change_datetime_for_user(chat, user_tz: datetime.tzinfo) -> datetime.datetime:
+    def _get_chat_change_datetime_for_user(chat, user_tz: tzinfo) -> datetime:
         change_dt = ChatExport._get_chat_change_datetime(chat)
         return change_dt.astimezone(user_tz)
 
     @staticmethod
-    def _get_chat_change_datetime(chat) -> datetime.datetime:
+    def _get_chat_change_datetime(chat) -> datetime:
         try:
-            return datetime.datetime.fromtimestamp(chat.updated_at, tz=datetime.timezone.utc)
+            return datetime.fromtimestamp(chat.updated_at, tz=timezone.utc)
         except (AttributeError, TypeError, ValueError, OSError, OverflowError):
-            return datetime.datetime.now(datetime.timezone.utc)
+            return datetime.now(timezone.utc)
 
     @staticmethod
     async def _remove_chat_files(root_dir: str, chat_id: str):
@@ -640,86 +677,41 @@ class ChatExport:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Action
+# Per-user change-detection snapshot
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _FolderSnapshot:
+    __slots__ = ("updated_at", "name", "parent_id")
 
-class Action:
-    actions = [
-        {"id": "run_now", "name": "Run Auto-Export Now"},
-    ]
+    def __init__(self, updated_at: int, name: str, parent_id: Optional[str]):
+        self.updated_at = updated_at
+        self.name = name
+        self.parent_id = parent_id
 
-    class Valves(BaseModel):
-        POLL_INTERVAL_SECONDS: int = Field(
-            default=300,
-            description="How often to check for changes (seconds). Set to 0 to disable background auto-run. Default: 5 minutes.",
-        )
-        OPEN_WEBUI_BASE_URL: str = Field(
-            default="",
-            description="Base URL of the Open WebUI instance (e.g., https://your.domain), for Markdown frontmatter link.",
-        )
-        EXPORT_DIR: str = Field(
-            default="/app/backend/data/Chats",
-            description="Root directory under which user chats will be saved.",
+    def differs(self, other: _FolderSnapshot) -> bool:
+        return (
+            self.updated_at != other.updated_at
+            or self.name != other.name
+            or self.parent_id != other.parent_id
         )
 
-    class UserValves(BaseModel):
-        ENABLED: bool = Field(
-            default=False,
-            description="Enable chat auto-export for this user.",
-        )
 
-    def __init__(self):
-        self.valves = self.Valves()
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        if int(self.valves.POLL_INTERVAL_SECONDS) > 0:
-            self._worker = _ExportWorker(self.valves, FUNCTION_ID)
-        else:
-            self._worker = None
+def _sanitize_filename(text: str) -> str:
+    """Removes characters that are invalid for file names."""
+    text = text.strip()
+    text = _truncate_utf8(text, 100)
+    text = "".join(ch if ch.isprintable() else "-" for ch in text)
+    text = re.sub(r'[<>:"/\\|?*]', "-", text)
+    text = text.replace(" ", "_")
+    if not text:
+        return "Untitled"
+    return text
 
-        log.info(
-            f"Auto-Export Chats initialized (polling every {self.valves.POLL_INTERVAL_SECONDS}s). "
-            f"Saving to: {os.path.abspath(self.valves.EXPORT_DIR)}"
-        )
 
-    @staticmethod
-    async def _emit_status(__event_emitter__, description: str, done: bool = True):
-        if __event_emitter__ is not None:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
-
-    async def action(
-        self,
-        body: dict,
-        __user__: Optional[dict] = None,
-        __id__: Optional[str] = None,
-        __request__=None,
-        __event_emitter__=None,
-    ):
-        user_id = str((__user__ or {}).get("id", ""))
-        if not user_id:
-            await self._emit_status(__event_emitter__, "Auto-export requires a logged-in user.")
-            return body
-
-        if __id__ == "run_now":
-            if self._worker is None:
-                # Create a temporary worker for one-off execution
-                worker = _ExportWorker(self.valves, FUNCTION_ID)
-                result = await worker.run_export_job()
-            else:
-                result = await self._worker.run_export_job()
-            if result == "success":
-                await self._emit_status(__event_emitter__, "Auto-export run completed.")
-            else:
-                await self._emit_status(__event_emitter__, "Auto-export run failed.")
-            return body
-
-        await self._emit_status(__event_emitter__, "Unknown auto-export action.")
-        return body
+def _truncate_utf8(string: str, max_bytes: int) -> str:
+    """Truncates a UTF-8 string to a maximum number of bytes without creating invalid characters."""
+    return string.encode("utf-8")[:max_bytes].decode("utf-8", "ignore")

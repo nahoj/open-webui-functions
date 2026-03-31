@@ -20,8 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from auto_export_chats.auto_export_chats_action import Action, _ExportWorker, ChatExport, SingleUserExport
-
+from auto_export_chats.auto_export_chats_action import Action, ExportWorker, ChatExport, SingleUserExport, AllUserExport
 
 # -----------------------------------------------------------------------------
 # Test Data Builders
@@ -99,7 +98,7 @@ class TestAutoExportIntegration:
         )
         act._function_id = "auto_export_chats"
         act.logger = MagicMock()
-        worker = _ExportWorker.__new__(_ExportWorker)
+        worker = ExportWorker.__new__(ExportWorker)
         worker.valves = act.valves
         worker.function_id = act._function_id
         worker.logger = act.logger
@@ -164,7 +163,7 @@ class TestAutoExportIntegration:
 
     @staticmethod
     def _run_export_job(action):
-        return asyncio.run(action._worker.run_export_job())
+        return asyncio.run(AllUserExport.run(action.valves))
 
     # -------------------------------------------------------------------------
     # Scenario: First-time export for a new user

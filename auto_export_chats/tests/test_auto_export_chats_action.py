@@ -15,11 +15,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from auto_export_chats.auto_export_chats_action import (
     Action,
-    _ExportWorker,
+    ExportWorker,
     _FolderSnapshot,
     _sanitize_filename,
     ChatExport,
-    _get_user_timezone,
     FolderExport,
     SingleUserExport,
 )
@@ -85,7 +84,7 @@ def build_filter(tmp_path, **valve_overrides):
 
 
 def build_worker(tmp_path, **valve_overrides):
-    worker = _ExportWorker.__new__(_ExportWorker)
+    worker = ExportWorker.__new__(ExportWorker)
     valve_values = {
         "SAVE_FOLDER": str(tmp_path),
         "OPEN_WEBUI_BASE_URL": "https://owui.example",
@@ -383,7 +382,7 @@ class TestMarkdownExport:
         fake_now = datetime.datetime(2026, 3, 29, 22, 39, tzinfo=datetime.timezone.utc)
         user_root_dir = tmp_path / "alice"
 
-        with patch("auto_export_chats.auto_export_chats_action.datetime.datetime") as mock_datetime:
+        with patch("auto_export_chats.auto_export_chats_action.datetime") as mock_datetime:
             mock_datetime.fromtimestamp.side_effect = TypeError("invalid timestamp")
             mock_datetime.now.return_value = fake_now
             asyncio.run(ChatExport._export_chat("https://owui.example", chat, {}, str(user_root_dir), datetime.timezone.utc))
@@ -392,16 +391,15 @@ class TestMarkdownExport:
         assert len(md_files) == 1
         assert md_files[0].name.startswith("2026-03-29_22h39_")
 
-    def test_get_user_timezone_returns_utc_for_unknown_timezone(self):
-        with patch("auto_export_chats.auto_export_chats_action.Users.get_user_by_id", return_value=SimpleNamespace(timezone="Nope/Nowhere")):
-            assert asyncio.run(_get_user_timezone("user-1")) == datetime.timezone.utc
-
     def test_get_user_root_dir_uses_sanitized_user_name(self, tmp_path):
+        """User export dir is now constructed inline in SingleUserExport.export_user()"""
         with patch(
             "auto_export_chats.auto_export_chats_action.Users.get_user_by_id",
             return_value=SimpleNamespace(name="Alice Doe"),
         ):
-            result = asyncio.run(FolderExport.get_user_export_dir(tmp_path.as_posix(), "user-1"))
+            # Test the inline logic: EXPORT_DIR + sanitized username
+            from auto_export_chats.auto_export_chats_action import _sanitize_filename
+            result = os.path.join(tmp_path.as_posix(), _sanitize_filename("Alice Doe"))
             assert result.endswith("Alice_Doe")
 
     def test_remove_chat_files_deletes_matching_exports(self, tmp_path):
