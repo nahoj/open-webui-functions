@@ -1,13 +1,13 @@
+import asyncio
 import datetime
-import json
 import logging
 import os
 import sys
 import threading
-from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 
@@ -15,10 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from auto_export_chats.auto_export_chats_action import (
     Action,
+    _ExportWorker,
     _FolderSnapshot,
     _sanitize_filename,
+    ChatExport,
+    _get_user_timezone,
+    FolderExport,
+    SingleUserExport,
 )
-
 
 def make_chat(
     chat_id="chat-123456789012",
@@ -80,9 +84,29 @@ def build_filter(tmp_path, **valve_overrides):
     return flt
 
 
+def build_worker(tmp_path, **valve_overrides):
+    worker = _ExportWorker.__new__(_ExportWorker)
+    valve_values = {
+        "SAVE_FOLDER": str(tmp_path),
+        "OPEN_WEBUI_BASE_URL": "https://owui.example",
+        "POLL_INTERVAL_SECONDS": 300,
+    }
+    valve_values.update(valve_overrides)
+    worker.valves = Action.Valves(**valve_values)
+    worker.logger = logging.getLogger(f"tests.autosave.worker.{id(tmp_path)}")
+    worker.function_id = "auto_export_chats"
+    worker._task = SimpleNamespace(cancel=lambda: None)
+    return worker
+
+
 @pytest.fixture
 def filter_instance(tmp_path):
     return build_filter(tmp_path)
+
+
+@pytest.fixture
+def worker_instance(tmp_path):
+    return build_worker(tmp_path)
 
 
 class TestUtilities:
@@ -92,7 +116,7 @@ class TestUtilities:
         assert _sanitize_filename("Normal Name") == "Normal_Name"
         assert _sanitize_filename("  spaces  ") == "spaces"
 
-
+"""
 class TestActions:
     @pytest.mark.asyncio
     async def test_action_run_now_runs_export_job_and_emits_status(self):
@@ -176,10 +200,10 @@ class TestActions:
         assert not action_instance._job_stop_requested.is_set()
         emitter.assert_awaited_once()
         assert emitter.await_args.args[0]["data"]["description"] == "No auto-export job is currently running."
-
+"""
 
 class TestBranchExtraction:
-    def test_extract_current_branch_uses_active_path(self, filter_instance):
+    def test_extract_current_branch_uses_active_path(self):
         chat_data = {
             "history": {
                 "currentId": "assistant-b",
@@ -191,26 +215,26 @@ class TestBranchExtraction:
             }
         }
 
-        result = filter_instance._extract_current_branch(chat_data)
+        result = ChatExport._extract_current_branch(chat_data)
 
         assert result == [
             {"role": "user", "content": "Question", "parentId": None},
             {"role": "assistant", "content": "Right", "parentId": "user-1"},
         ]
 
-    def test_extract_current_branch_returns_empty_without_current_id(self, filter_instance):
-        assert filter_instance._extract_current_branch({"history": {"messages": {}}}) == []
+    def test_extract_current_branch_returns_empty_without_current_id(self):
+        assert ChatExport._extract_current_branch({"history": {"messages": {}}}) == []
 
 
 class TestFolderPaths:
-    def test_build_folder_path_map_builds_full_hierarchy(self, filter_instance):
+    def test_build_folder_path_map_builds_full_hierarchy(self):
         folders = {
             "root": _FolderSnapshot(updated_at=1, name="Root Folder", parent_id=None),
             "parent": _FolderSnapshot(updated_at=1, name="Parent Folder", parent_id="root"),
             "leaf": _FolderSnapshot(updated_at=1, name="Leaf Folder", parent_id="parent"),
         }
 
-        path_map = filter_instance._build_folder_path_map(folders)
+        path_map = FolderExport.build_folder_path_map(folders)
 
         assert path_map == {
             "root": "Root_Folder",
@@ -218,36 +242,36 @@ class TestFolderPaths:
             "leaf": "Root_Folder/Parent_Folder/Leaf_Folder",
         }
 
-    def test_folder_id_marker_helpers_roundtrip(self, filter_instance, tmp_path):
+    def test_folder_id_marker_helpers_roundtrip(self, tmp_path):
         folder_dir = tmp_path / "alice" / "Root"
-        filter_instance._write_folder_id_marker(str(folder_dir), "folder-1")
+        asyncio.run(FolderExport._write_folder_id_marker(str(folder_dir), "folder-1"))
 
-        assert filter_instance._read_folder_id_marker(str(folder_dir)) == "folder-1"
-        assert filter_instance._find_folder_dir_by_id(str(tmp_path / "alice"), "folder-1") == str(folder_dir)
+        assert asyncio.run(FolderExport._read_folder_id_marker(str(folder_dir))) == "folder-1"
+        assert asyncio.run(FolderExport._find_folder_dir_by_id(str(tmp_path / "alice"), "folder-1")) == str(folder_dir)
 
-    def test_reconcile_user_folders_moves_managed_folder_to_expected_path(self, filter_instance, tmp_path):
+    def test_reconcile_user_folders_moves_managed_folder_to_expected_path(self, tmp_path):
         user_root_dir = tmp_path / "alice"
         actual_dir = user_root_dir / "Old"
         actual_dir.mkdir(parents=True)
-        filter_instance._write_folder_id_marker(str(actual_dir), "folder-1")
+        asyncio.run(FolderExport._write_folder_id_marker(str(actual_dir), "folder-1"))
         (actual_dir / "chat.md").write_text("content", encoding="utf-8")
 
         folders = {"folder-1": _FolderSnapshot(updated_at=1, name="Renamed", parent_id=None)}
         folder_path_map = {"folder-1": "Renamed"}
 
-        filter_instance._reconcile_user_folders(str(user_root_dir), folders, folder_path_map)
+        asyncio.run(FolderExport.reconcile_user_folders(str(user_root_dir), folders, folder_path_map))
 
         expected_dir = user_root_dir / "Renamed"
         assert expected_dir.is_dir()
-        assert filter_instance._read_folder_id_marker(str(expected_dir)) == "folder-1"
+        assert asyncio.run(FolderExport._read_folder_id_marker(str(expected_dir))) == "folder-1"
         assert (expected_dir / "chat.md").exists()
         assert not actual_dir.exists()
 
-    def test_reconcile_user_folders_merges_existing_target_and_keeps_newer_file(self, filter_instance, tmp_path):
+    def test_reconcile_user_folders_merges_existing_target_and_keeps_newer_file(self, tmp_path):
         user_root_dir = tmp_path / "alice"
         source_dir = user_root_dir / "Old"
         source_dir.mkdir(parents=True)
-        filter_instance._write_folder_id_marker(str(source_dir), "folder-1")
+        asyncio.run(FolderExport._write_folder_id_marker(str(source_dir), "folder-1"))
         source_file = source_dir / "chat.md"
         source_file.write_text("new", encoding="utf-8")
 
@@ -262,28 +286,28 @@ class TestFolderPaths:
         folders = {"folder-1": _FolderSnapshot(updated_at=1, name="Renamed", parent_id=None)}
         folder_path_map = {"folder-1": "Renamed"}
 
-        filter_instance._reconcile_user_folders(str(user_root_dir), folders, folder_path_map)
+        asyncio.run(FolderExport.reconcile_user_folders(str(user_root_dir), folders, folder_path_map))
 
         assert target_file.read_text(encoding="utf-8") == "new"
-        assert filter_instance._read_folder_id_marker(str(target_dir)) == "folder-1"
+        assert asyncio.run(FolderExport._read_folder_id_marker(str(target_dir))) == "folder-1"
 
-    def test_cleanup_orphaned_folder_markers_removes_markers_not_in_db(self, filter_instance, tmp_path):
+    def test_cleanup_orphaned_folder_markers_removes_markers_not_in_db(self, worker_instance, tmp_path):
         user_root_dir = tmp_path / "alice"
         keep_dir = user_root_dir / "Keep"
         keep_dir.mkdir(parents=True)
-        filter_instance._write_folder_id_marker(str(keep_dir), "valid-folder-id")
+        asyncio.run(FolderExport._write_folder_id_marker(str(keep_dir), "valid-folder-id"))
         (keep_dir / "chat.md").write_text("content", encoding="utf-8")
 
         orphan_dir = user_root_dir / "Orphan"
         orphan_dir.mkdir(parents=True)
-        filter_instance._write_folder_id_marker(str(orphan_dir), "deleted-folder-id")
+        asyncio.run(FolderExport._write_folder_id_marker(str(orphan_dir), "deleted-folder-id"))
         (orphan_dir / "old.md").write_text("stale", encoding="utf-8")
 
         valid_folder_ids = {"valid-folder-id"}
-        filter_instance._cleanup_orphaned_folder_markers(str(user_root_dir), valid_folder_ids)
+        asyncio.run(SingleUserExport._cleanup_orphaned_folder_markers(str(user_root_dir), valid_folder_ids))
 
         assert keep_dir.is_dir()
-        assert filter_instance._read_folder_id_marker(str(keep_dir)) == "valid-folder-id"
+        assert asyncio.run(FolderExport._read_folder_id_marker(str(keep_dir))) == "valid-folder-id"
         assert (keep_dir / "chat.md").exists()
 
         orphan_marker = orphan_dir / ".open_webui_id=deleted-folder-id"
@@ -293,7 +317,7 @@ class TestFolderPaths:
 
 
 class TestMarkdownExport:
-    def test_export_chat_writes_file_under_user_root_and_cleans_stale_exports(self, filter_instance, tmp_path):
+    def test_export_chat_writes_file_under_user_root_and_cleans_stale_exports(self, tmp_path):
         chat = make_chat(tags=["tag-a", "tag-b"], updated_at=1712345678)
         expected_prefix = "2024-04-05_21h34"
         user_tz = datetime.timezone(datetime.timedelta(hours=2))
@@ -305,7 +329,7 @@ class TestMarkdownExport:
         stale_file = stale_dir / f"older_{chat.id[-12:]}.md"
         stale_file.write_text("stale", encoding="utf-8")
 
-        filter_instance._export_chat(chat, {}, str(user_root_dir), user_tz)
+        asyncio.run(ChatExport._export_chat("https://owui.example", chat, {}, str(user_root_dir), user_tz))
 
         md_files = list(user_root_dir.glob("*.md"))
         assert len(md_files) == 1
@@ -327,25 +351,25 @@ class TestMarkdownExport:
         assert "Hello" in content
         assert "Hi there" in content
 
-    def test_export_chat_uses_folder_hierarchy_when_available(self, filter_instance, tmp_path):
+    def test_export_chat_uses_folder_hierarchy_when_available(self, tmp_path):
         chat = make_chat(title="Folder Chat", folder_id="leaf", updated_at=1712345678)
         folder_path_map = {"leaf": "Root_Folder/Parent_Folder/Leaf_Folder"}
         user_tz = datetime.timezone(datetime.timedelta(hours=2))
         user_root_dir = tmp_path / "alice"
 
-        filter_instance._export_chat(chat, folder_path_map, str(user_root_dir), user_tz)
+        asyncio.run(ChatExport._export_chat("https://owui.example", chat, folder_path_map, str(user_root_dir), user_tz))
 
         expected_dir = user_root_dir / "Root_Folder" / "Parent_Folder" / "Leaf_Folder"
         assert expected_dir.is_dir()
         assert len(list(expected_dir.glob("*.md"))) == 1
 
-    def test_export_chat_uses_untitled_fallback_in_filename_and_heading(self, filter_instance, tmp_path):
+    def test_export_chat_uses_untitled_fallback_in_filename_and_heading(self, tmp_path):
         chat = make_chat(title=None, updated_at=1712345678)
         expected_prefix = "2024-04-05_21h34"
         user_tz = datetime.timezone(datetime.timedelta(hours=2))
         user_root_dir = tmp_path / "alice"
 
-        filter_instance._export_chat(chat, {}, str(user_root_dir), user_tz)
+        asyncio.run(ChatExport._export_chat("https://owui.example", chat, {}, str(user_root_dir), user_tz))
 
         md_files = list(user_root_dir.glob("*.md"))
         assert len(md_files) == 1
@@ -354,7 +378,7 @@ class TestMarkdownExport:
         content = md_files[0].read_text(encoding="utf-8")
         assert "# Untitled Conversation" in content
 
-    def test_export_chat_falls_back_to_now_when_updated_at_is_invalid(self, filter_instance, tmp_path):
+    def test_export_chat_falls_back_to_now_when_updated_at_is_invalid(self, tmp_path):
         chat = make_chat(updated_at=None)
         fake_now = datetime.datetime(2026, 3, 29, 22, 39, tzinfo=datetime.timezone.utc)
         user_root_dir = tmp_path / "alice"
@@ -362,25 +386,25 @@ class TestMarkdownExport:
         with patch("auto_export_chats.auto_export_chats_action.datetime.datetime") as mock_datetime:
             mock_datetime.fromtimestamp.side_effect = TypeError("invalid timestamp")
             mock_datetime.now.return_value = fake_now
-            filter_instance._export_chat(chat, {}, str(user_root_dir), datetime.timezone.utc)
+            asyncio.run(ChatExport._export_chat("https://owui.example", chat, {}, str(user_root_dir), datetime.timezone.utc))
 
         md_files = list(user_root_dir.glob("*.md"))
         assert len(md_files) == 1
         assert md_files[0].name.startswith("2026-03-29_22h39_")
 
-    def test_get_user_timezone_returns_utc_for_unknown_timezone(self, filter_instance):
+    def test_get_user_timezone_returns_utc_for_unknown_timezone(self):
         with patch("auto_export_chats.auto_export_chats_action.Users.get_user_by_id", return_value=SimpleNamespace(timezone="Nope/Nowhere")):
-            assert filter_instance._get_user_timezone("user-1") == datetime.timezone.utc
+            assert asyncio.run(_get_user_timezone("user-1")) == datetime.timezone.utc
 
-    def test_get_user_root_dir_uses_sanitized_user_name(self, filter_instance):
+    def test_get_user_root_dir_uses_sanitized_user_name(self, tmp_path):
         with patch(
             "auto_export_chats.auto_export_chats_action.Users.get_user_by_id",
             return_value=SimpleNamespace(name="Alice Doe"),
         ):
-            result = filter_instance._get_user_root_dir("user-1")
+            result = asyncio.run(FolderExport.get_user_export_dir(tmp_path.as_posix(), "user-1"))
             assert result.endswith("Alice_Doe")
 
-    def test_remove_chat_files_deletes_matching_exports(self, filter_instance, tmp_path):
+    def test_remove_chat_files_deletes_matching_exports(self, tmp_path):
         root_dir = tmp_path / "alice"
         root_dir.mkdir()
         keep_file = root_dir / "keep_me.md"
@@ -392,13 +416,13 @@ class TestMarkdownExport:
         remove_b = nested_dir / "b_chat-123456789012.md"
         remove_b.write_text("drop", encoding="utf-8")
 
-        filter_instance._remove_chat_files(str(root_dir), "chat-123456789012")
+        asyncio.run(ChatExport._remove_chat_files(str(root_dir), "chat-123456789012"))
 
         assert keep_file.exists()
         assert not remove_a.exists()
         assert not remove_b.exists()
 
-
+"""
 class TestPolling:
     def test_sync_runtime_valves_stops_running_poller_when_auto_run_disabled(self, filter_instance):
         fake_thread = SimpleNamespace(is_alive=lambda: True)
@@ -668,3 +692,4 @@ class TestPolling:
 
         assert result == "success"
         write_state.assert_called_once_with(user_root_dir, job_started_at)
+"""

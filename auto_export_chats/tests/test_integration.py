@@ -7,20 +7,20 @@ These tests exercise the full export flow end-to-end:
 - Tests are written in Given/When/Then style for readability
 """
 
+import asyncio
 import datetime
 import json
-import os
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
-from contextlib import contextmanager
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from auto_export_chats.auto_export_chats_action import Action
+from auto_export_chats.auto_export_chats_action import Action, _ExportWorker, ChatExport, SingleUserExport
 
 
 # -----------------------------------------------------------------------------
@@ -93,19 +93,18 @@ class TestAutoExportIntegration:
         """Provide a configured Action instance."""
         act = Action.__new__(Action)
         act.valves = Action.Valves(
-            SAVE_FOLDER=str(export_root),
+            EXPORT_DIR=str(export_root),
             OPEN_WEBUI_BASE_URL="https://owui.example.com",
             POLL_INTERVAL_SECONDS=0,  # Disable background polling
         )
         act._function_id = "auto_export_chats"
-        act._run_lock = MagicMock()
-        act._run_lock.acquire.return_value = True
-        act._job_running = MagicMock()
-        act._stop_event = MagicMock()
-        act._job_stop_requested = MagicMock()
-        act._job_stop_requested.is_set.return_value = False
-        act._poll_thread = None
         act.logger = MagicMock()
+        worker = _ExportWorker.__new__(_ExportWorker)
+        worker.valves = act.valves
+        worker.function_id = act._function_id
+        worker.logger = act.logger
+        worker._task = SimpleNamespace(cancel=lambda: None)
+        act._worker = worker
         return act
 
     @contextmanager
@@ -135,11 +134,11 @@ class TestAutoExportIntegration:
             return SimpleNamespace(is_active=function_active)
 
         # Mock _query_folders static method
-        def mock_query_folders(user_id):
+        async def mock_query_folders(user_id):
             return folders
 
         # Mock _query_chat_ids_to_export static method
-        def mock_query_chat_ids_to_export(user_id, since):
+        async def mock_query_chat_ids_to_export(user_id, since):
             result = []
             for cid, chat in chats.items():
                 if chat.user_id == user_id:
@@ -151,9 +150,8 @@ class TestAutoExportIntegration:
             patch("auto_export_chats.auto_export_chats_action.Users.get_users", mock_get_users),
             patch("auto_export_chats.auto_export_chats_action.Users.get_user_by_id", mock_get_user_by_id),
             patch("auto_export_chats.auto_export_chats_action.Chats.get_chat_by_id", mock_get_chat_by_id),
-            patch("auto_export_chats.auto_export_chats_action.Functions.get_function_by_id", mock_get_function_by_id),
-            patch.object(Action, "_query_folders", staticmethod(mock_query_folders)),
-            patch.object(Action, "_query_chat_ids_to_export", staticmethod(mock_query_chat_ids_to_export)),
+            patch.object(SingleUserExport, "_query_folders", staticmethod(mock_query_folders)),
+            patch.object(ChatExport, "_query_chat_ids_to_export", staticmethod(mock_query_chat_ids_to_export)),
         ]
 
         for p in patches:
@@ -163,6 +161,10 @@ class TestAutoExportIntegration:
         finally:
             for p in patches:
                 p.stop()
+
+    @staticmethod
+    def _run_export_job(action):
+        return asyncio.run(action._worker.run_export_job())
 
     # -------------------------------------------------------------------------
     # Scenario: First-time export for a new user
@@ -180,7 +182,7 @@ class TestAutoExportIntegration:
 
         with self.mock_db(users=[user], chats={"chat-123": chat}):
             # When
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         user_dir = export_root / "Alice"
@@ -216,7 +218,7 @@ class TestAutoExportIntegration:
 
         with self.mock_db(users=[user], chats={"chat-456": chat}, folders=folders):
             # When
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         expected_path = export_root / "Bob" / "Projects" / "Work" / "Q1"
@@ -246,7 +248,7 @@ class TestAutoExportIntegration:
 
         with self.mock_db(users=[user],
                          chats={"chat-old": old_chat, "chat-new": new_chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         user_dir = export_root / "Carol"
         initial_files = set(f.name for f in user_dir.glob("*.md"))
@@ -259,7 +261,7 @@ class TestAutoExportIntegration:
         with self.mock_db(users=[user],
                          chats={"chat-old": old_chat, "chat-new": updated_chat}):
             # When - Second export run
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         final_files = set(f.name for f in user_dir.glob("*.md"))
@@ -287,7 +289,7 @@ class TestAutoExportIntegration:
                         user_id="user-dave", folder_id="folder-1")
 
         with self.mock_db(users=[user], chats={"chat-789": chat}, folders=old_folders):
-            action._run_export_job()
+            self._run_export_job(action)
 
         old_path = export_root / "Dave" / "OldName"
         assert old_path.exists()
@@ -298,7 +300,7 @@ class TestAutoExportIntegration:
         new_folders = {"folder-1": make_folder("folder-1", "NewName")}
 
         with self.mock_db(users=[user], chats={"chat-789": chat}, folders=new_folders):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         new_path = export_root / "Dave" / "NewName"
@@ -327,7 +329,7 @@ class TestAutoExportIntegration:
                         user_id="user-eve", folder_id="inbox", updated_at=base_time)
 
         with self.mock_db(users=[user], chats={"chat-move": chat}, folders=folders):
-            action._run_export_job()
+            self._run_export_job(action)
 
         inbox_path = export_root / "Eve" / "Inbox"
         assert any("chat-move" in f.name for f in inbox_path.glob("*.md")), \
@@ -339,7 +341,7 @@ class TestAutoExportIntegration:
                               updated_at=base_time + 3600)  # 1 hour later
 
         with self.mock_db(users=[user], chats={"chat-move": moved_chat}, folders=folders):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         archive_path = export_root / "Eve" / "Archive"
@@ -372,7 +374,7 @@ class TestAutoExportIntegration:
             chats={"chat-enabled": enabled_chat, "chat-disabled": disabled_chat}
         ):
             # When
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         assert (export_root / "EnabledUser").exists(), "Enabled user should have exports"
@@ -395,7 +397,7 @@ class TestAutoExportIntegration:
                               user_id="user-frank", updated_at=base_time)
 
         with self.mock_db(users=[user], chats={"chat-first": first_chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Verify state file exists
         user_dir = export_root / "Frank"
@@ -419,7 +421,7 @@ class TestAutoExportIntegration:
         with self.mock_db(users=[user], chats={"chat-first": first_chat, "chat-second": second_chat}):
             with patch("auto_export_chats.auto_export_chats_action.Chats.get_chat_by_id") as mock_get:
                 mock_get.side_effect = tracking_get_chat
-                action._run_export_job()
+                self._run_export_job(action)
 
         # Then - Only the new chat should have been fetched (old one filtered by timestamp)
         # Note: get_chat_by_id is only called for chats that pass the timestamp filter
@@ -442,7 +444,7 @@ class TestAutoExportIntegration:
                         user_id="user-grace", folder_id="folder-del")
 
         with self.mock_db(users=[user], chats={"chat-del": chat}, folders=folders):
-            action._run_export_job()
+            self._run_export_job(action)
 
         folder_path = export_root / "Grace" / "ToDelete"
         marker_file = folder_path / ".open_webui_id=folder-del"
@@ -450,7 +452,7 @@ class TestAutoExportIntegration:
 
         # When - Folder deleted in OWUI (empty folders dict)
         with self.mock_db(users=[user], chats={"chat-del": chat}, folders={}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         assert not marker_file.exists(), "Marker should be removed for deleted folder"
@@ -473,7 +475,7 @@ class TestAutoExportIntegration:
                         user_id="user-henry")
 
         with self.mock_db(users=[user], chats={"chat-untitled": chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         user_dir = export_root / "Henry"
@@ -500,7 +502,7 @@ class TestAutoExportIntegration:
                         user_id="user-ivy", tags=["important", "work", "follow-up"])
 
         with self.mock_db(users=[user], chats={"chat-tags": chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         user_dir = export_root / "Ivy"
@@ -531,7 +533,7 @@ class TestAutoExportIntegration:
                                  user_id="user-jack", updated_at=base_time)
 
         with self.mock_db(users=[user], chats={"chat-mod": original_chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         user_dir = export_root / "Jack"
         original_files = list(user_dir.glob("*chat-mod*.md"))
@@ -543,7 +545,7 @@ class TestAutoExportIntegration:
                                  user_id="user-jack", updated_at=base_time + 1000)
 
         with self.mock_db(users=[user], chats={"chat-mod": modified_chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         current_files = list(user_dir.glob("*chat-mod*.md"))
@@ -570,7 +572,7 @@ class TestAutoExportIntegration:
         empty_chat.chat = {"history": {"currentId": None, "messages": {}}}
 
         with self.mock_db(users=[user], chats={"chat-empty": empty_chat}):
-            action._run_export_job()
+            self._run_export_job(action)
 
         # Then
         user_dir = export_root / "Kate"
