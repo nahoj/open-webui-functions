@@ -9,7 +9,7 @@ author: Johan Grande, agents
 repository: https://github.com/nahoj/open-webui-functions
 version: 4.0
 license: MIT
-requirements: aiofiles, anyio
+requirements: aiofiles, anyio, apscheduler
 description: Automatically export chats to Markdown files.
 
 This function creates a background job that exports new and changed chats every 5 minutes by default.
@@ -37,6 +37,7 @@ from datetime import datetime, timezone, tzinfo
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, Field
 
 from open_webui.internal.db import get_db_context
@@ -59,7 +60,7 @@ class Action:
     ]
 
     class Valves(BaseModel):
-        POLL_INTERVAL_SECONDS: int = Field(
+        EXPORT_INTERVAL_SECONDS: int = Field(
             default=300,
             description="How often to check for changes (seconds). Set to 0 to disable background auto-run. Default: 5 minutes.",
         )
@@ -80,33 +81,10 @@ class Action:
 
     def __init__(self):
         self.valves = self.Valves()
-
-        if int(self.valves.POLL_INTERVAL_SECONDS) > 0:
-            self._worker = ExportWorker(self.valves)
-        else:
-            self._worker = None
-
-        log.info(
-            f"Auto-Export Chats initialized (polling every {self.valves.POLL_INTERVAL_SECONDS}s). "
-            f"Saving to: {os.path.abspath(self.valves.EXPORT_DIR)}"
-        )
+        self._scheduler = ExportScheduler(self.valves)
 
     def __del__(self):
-        if self._worker:
-            self._worker.cancel()
-
-    @staticmethod
-    async def _emit_status(__event_emitter__, description: str, done: bool = True):
-        if __event_emitter__ is not None:
-            await __event_emitter__(
-                {
-                    "type": "status",
-                    "data": {
-                        "description": description,
-                        "done": done,
-                    },
-                }
-            )
+        self._scheduler.shutdown()
 
     async def action(
         self,
@@ -121,42 +99,61 @@ class Action:
             await self._emit_status(__event_emitter__, "Auto-export requires a logged-in user.")
             return body
 
-        # if __id__ == "run_now":
-        #     if self._worker is None:
-        #         # Create a temporary worker for one-off execution
-        #         worker = ExportWorker(self.valves)
-        #         result = await worker.run_export_job()
-        #     else:
-        #         result = await self._worker.run_export_job()
-        #     if result == "success":
-        #         await self._emit_status(__event_emitter__, "Auto-export run completed.")
-        #     else:
-        #         await self._emit_status(__event_emitter__, "Auto-export run failed.")
-        #     return body
+        if __id__ == "run_now":
+            result = await self._scheduler.run_export_with_lock()
+            if result == "skipped":
+                await self._emit_status(__event_emitter__, "Auto-export already running.")
+            elif result == "success":
+                await self._emit_status(__event_emitter__, "Auto-export completed.")
+            else:
+                await self._emit_status(__event_emitter__, "Auto-export failed.")
+            return body
 
         await self._emit_status(__event_emitter__, "Unknown auto-export action.")
         return body
 
+    @staticmethod
+    async def _emit_status(__event_emitter__, description: str, done: bool = True):
+        if __event_emitter__ is not None:
+            await __event_emitter__({"type": "status", "data": {"description": description, "done": done}})
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ExportWorker
+# ExportScheduler
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class ExportWorker:
+class ExportScheduler:
+    _JOB_ID = "auto_export"
+
     def __init__(self, valves):
-        self.valves = valves
-        self._task = asyncio.get_running_loop().create_task(self._run())
+        self._valves = valves
+        self._lock = asyncio.Lock()
+        self._scheduler = AsyncIOScheduler()
 
-    def cancel(self):
-        self._task.cancel()
+        interval = int(valves.EXPORT_INTERVAL_SECONDS)
+        if interval > 0:
+            self._scheduler.add_job(
+                self.run_export_with_lock, "interval",
+                seconds=interval,
+                id=self._JOB_ID,
+            )
+        self._scheduler.start()
 
-    async def _run(self):
-        try:
-            while True:
-                await asyncio.sleep(self.valves.POLL_INTERVAL_SECONDS)
-                await AllUserExport.run(self.valves)
-        except asyncio.CancelledError:
-            pass
+        log.info(
+            f"Auto-Export Chats initialized (polling every {interval}s). "
+            f"Saving to: {os.path.abspath(valves.EXPORT_DIR)}"
+        )
+
+    def shutdown(self):
+        if self._scheduler.running:
+            self._scheduler.shutdown(wait=False)
+
+    async def run_export_with_lock(self) -> str:
+        if self._lock.locked():
+            log.info("Export already running, skipping")
+            return "skipped"
+        async with self._lock:
+            return await AllUserExport.run(self._valves)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -168,11 +165,10 @@ class AllUserExport:
     @staticmethod
     async def run(valves: Action.Valves) -> str:
         try:
-            job_started_at = datetime.now(timezone.utc)
             user_ids = await AllUserExport._get_enabled_user_ids()
             log.info(f"Starting export job for {len(user_ids)} user(s): {user_ids}")
             for user_id in user_ids:
-                await SingleUserExport.export_user(user_id, job_started_at, valves)
+                await SingleUserExport.export_user(user_id, valves)
             return "success"
         except Exception:
             log.error(f"Error running chat export", exc_info=True)
@@ -216,12 +212,14 @@ class AllUserExport:
 class SingleUserExport:
 
     @staticmethod
-    async def export_user(user_id: str, job_started_at: datetime, valves: Action.Valves):
+    async def export_user(user_id: str, valves: Action.Valves):
         user = await asyncio.to_thread(Users.get_user_by_id, user_id)
 
         user_export_dir = os.path.join(valves.EXPORT_DIR, _sanitize_filename(user.name))
         last_successful_export_at = await SingleUserExport._read_last_successful_export_at(user_export_dir)
+
         log.info(f"User {user_id}: root_dir={user_export_dir}, last_successful_export_at={last_successful_export_at}")
+        job_started_at = datetime.now(timezone.utc)
 
         cur_folders = await SingleUserExport._query_folders(user_id)
         # log.info(f"User {user_id}: {len(cur_folders)} folder(s) in DB")
