@@ -13,14 +13,13 @@ requirements: aiofiles, anyio, apscheduler
 description: Automatically export chats to Markdown files.
 
 This function creates a background job that exports new and changed chats every 5 minutes by default.
-Chats are exported to folders mirroring OWUI's.
+Chats are exported to folders mirroring the UI's.
 
 The export is opt-in per user with a UserValve (in a chat, Controls > Valves > Functions).
 
-This function also provides an action button (enabled with Global/model toggle) to run the export once manually.
+This function provides action buttons (enabled with Global/model toggle) to enable/disable the background exports.
 
-You can leave the button disabled if you only want the export to run in the background,
-as long as the main toggle for this function is on.
+NOTE: The main toggle for this function in the admin UI has NO EFFECT on the background job, nor does showing/hiding the action buttons.
 """
 
 import asyncio
