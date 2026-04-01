@@ -55,8 +55,14 @@ log.setLevel(logging.DEBUG)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Action:
+    calendar_icon = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIj48cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik02Ljc1IDN2Mi4yNU0xNy4yNSAzdjIuMjVNMyAxOC43NVY3LjVhMi4yNSAyLjI1IDAgMCAxIDIuMjUtMi4yNWgxMy41QTIuMjUgMi4yNSAwIDAgMSAyMSA3LjV2MTEuMjVtLTE4IDBBMi4yNSAyLjI1IDAgMCAwIDUuMjUgMjFoMTMuNUEyLjI1IDIuMjUgMCAwIDAgMjEgMTguNzVtLTE4IDB2LTcuNUEyLjI1IDIuMjUgMCAwIDEgNS4yNSA5aDEzLjVBMi4yNSAyLjI1IDAgMCAxIDIxIDExLjI1djcuNSIvPjwvc3ZnPg=="
+    x_cross_icon = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyMCAyMCIgZmlsbD0iY3VycmVudENvbG9yIj48cGF0aCBkPSJNNi4yOCA1LjIyYS43NS43NSAwIDAwLTEuMDYgMS4wNkw4Ljk0IDEwbC0zLjcyIDMuNzJhLjc1Ljc1IDAgMTAxLjA2IDEuMDZMMTAgMTEuMDZsMy43MiAzLjcyYS43NS43NSAwIDEwMS4wNi0xLjA2TDExLjA2IDEwbDMuNzItMy43MmEuNzUuNzUgMCAwMC0xLjA2LTEuMDZMMTAgOC45NCA2LjI4IDUuMjJ6Ii8+PC9zdmc+"
+    info_circle_icon = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIGZpbGw9Im5vbmUiIHZpZXdCb3g9IjAgMCAyNCAyNCIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZT0iY3VycmVudENvbG9yIj48cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0xMiAxMS41VjE2LjUiLz48cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0xMiA3LjUxTDEyLjAxIDcuNDk4ODkiLz48cGF0aCBzdHJva2UtbGluZWNhcD0icm91bmQiIHN0cm9rZS1saW5lam9pbj0icm91bmQiIGQ9Ik0xMiAyMkMxNy41MjI4IDIyIDIyIDE3LjUyMjggMjIgMTJDMjIgNi40NzcxNSAxNy41MjI4IDIgMTIgMkM2LjQ3NzE1IDIgMiA2LjQ3NzE1IDIgMTJDMiAxNy41MjI4IDYuNDc3MTUgMjIgMTIgMjJaIi8+PC9zdmc+"
     actions = [
-        {"id": "run_now", "name": "Run Auto-Export Now"},
+        {"id": "enable_bg", "name": "Chat Export: Enable Background Export", "icon_url": calendar_icon},
+        {"id": "disable_bg", "name": "Chat Export: Disable Background Export", "icon_url": x_cross_icon},
+        {"id": "run_once_now", "name": "Chat Export: Run Once Now"},
+        {"id": "status", "name": "Chat Export: Status", "icon_url": info_circle_icon},
     ]
 
     class Valves(BaseModel):
@@ -64,13 +70,13 @@ class Action:
             default=300,
             description="How often to check for changes (seconds). Set to 0 to disable background auto-run. Default: 5 minutes.",
         )
-        OPEN_WEBUI_BASE_URL: str = Field(
-            default="",
-            description="Base URL of the Open WebUI instance (e.g., https://your.domain), for Markdown frontmatter link.",
-        )
         EXPORT_DIR: str = Field(
             default="/app/backend/data/Chats",
             description="Root directory under which user chats will be saved.",
+        )
+        OPEN_WEBUI_BASE_URL: str = Field(
+            default="",
+            description="Base URL of the Open WebUI instance (e.g., https://your.domain), for Markdown frontmatter link.",
         )
 
     class UserValves(BaseModel):
@@ -80,11 +86,24 @@ class Action:
         )
 
     def __init__(self):
-        self.valves = self.Valves()
-        self._scheduler = ExportScheduler(self.valves)
+        self._valves = None
+        self._scheduler = None
 
     def __del__(self):
-        self._scheduler.shutdown()
+        if self._scheduler:
+            self._scheduler.shutdown()
+
+    @property
+    def valves(self) -> Action.Valves:
+        return self._valves
+
+    @valves.setter
+    def valves(self, valves: Action.Valves):
+        self._valves = valves
+        if self._scheduler:
+            self._scheduler.update_valves(valves)
+        else:
+            self._scheduler = ExportScheduler(valves)
 
     async def action(
         self,
@@ -99,17 +118,33 @@ class Action:
             await self._emit_status(__event_emitter__, "Auto-export requires a logged-in user.")
             return body
 
-        if __id__ == "run_now":
+        if __id__ == "enable_bg":
+            if self._scheduler.start_background():
+                await self._emit_status(__event_emitter__, "Background export started.")
+            else:
+                await self._emit_status(__event_emitter__, "Background export already running.")
+
+        elif __id__ == "disable_bg":
+            if self._scheduler.stop_background():
+                await self._emit_status(__event_emitter__, "Background export stopped.")
+            else:
+                await self._emit_status(__event_emitter__, "Background export not running.")
+
+        elif __id__ == "run_once_now":
             result = await self._scheduler.run_export_with_lock()
             if result == "skipped":
-                await self._emit_status(__event_emitter__, "Auto-export already running.")
+                await self._emit_status(__event_emitter__, "Export already running.")
             elif result == "success":
-                await self._emit_status(__event_emitter__, "Auto-export completed.")
+                await self._emit_status(__event_emitter__, "Export completed.")
             else:
-                await self._emit_status(__event_emitter__, "Auto-export failed.")
-            return body
+                await self._emit_status(__event_emitter__, "Export failed.")
 
-        await self._emit_status(__event_emitter__, "Unknown auto-export action.")
+        elif __id__ == "status":
+            await self._emit_status(__event_emitter__, self._scheduler.status())
+
+        else:
+            await self._emit_status(__event_emitter__, "Unknown action.")
+
         return body
 
     @staticmethod
@@ -126,27 +161,74 @@ class ExportScheduler:
     _JOB_ID = "auto_export"
 
     def __init__(self, valves):
-        self._valves = valves
         self._lock = asyncio.Lock()
         self._scheduler = AsyncIOScheduler()
+        self._scheduler.start()
+        self._valves = None
+        self.update_valves(valves)
 
-        interval = int(valves.EXPORT_INTERVAL_SECONDS)
-        if interval > 0:
+    def update_valves(self, valves):
+        if valves == self._valves:
+            return
+
+        self._valves = valves
+        interval = max(int(valves.EXPORT_INTERVAL_SECONDS), 0)
+        job = self._scheduler.get_job(self._JOB_ID)
+
+        if interval <= 0:
+            if job:
+                self._scheduler.remove_job(self._JOB_ID)
+            log.info("Auto-Export Chats background disabled (interval=0)")
+            return
+
+        if job:
+            job.reschedule(trigger="interval", seconds=interval)
+        else:
             self._scheduler.add_job(
-                self.run_export_with_lock, "interval",
+                self.run_export_with_lock,
+                "interval",
                 seconds=interval,
                 id=self._JOB_ID,
             )
-        self._scheduler.start()
 
         log.info(
-            f"Auto-Export Chats initialized (polling every {interval}s). "
+            f"Auto-Export Chats configured (polling every {interval}s). "
             f"Saving to: {os.path.abspath(valves.EXPORT_DIR)}"
         )
 
     def shutdown(self):
-        if self._scheduler.running:
-            self._scheduler.shutdown(wait=False)
+        try:
+            if self._scheduler.running:
+                self._scheduler.shutdown(wait=False)
+        except RuntimeError:
+            pass
+
+    def start_background(self) -> bool:
+        if self._scheduler.get_job(self._JOB_ID):
+            return False
+        interval = max(int(self._valves.EXPORT_INTERVAL_SECONDS), 60)
+        self._scheduler.add_job(
+            self.run_export_with_lock, "interval",
+            seconds=interval,
+            id=self._JOB_ID,
+        )
+        log.info(f"Background export started (every {interval}s)")
+        return True
+
+    def stop_background(self) -> bool:
+        if not self._scheduler.get_job(self._JOB_ID):
+            return False
+        self._scheduler.remove_job(self._JOB_ID)
+        log.info("Background export stopped")
+        return True
+
+    def status(self) -> str:
+        running = "yes" if self._lock.locked() else "no"
+        job = self._scheduler.get_job(self._JOB_ID)
+        if job:
+            next_run = job.next_run_time
+            return f"Background: on (next: {next_run:%H:%M:%S}). Running: {running}."
+        return f"Background: off. Running: {running}."
 
     async def run_export_with_lock(self) -> str:
         if self._lock.locked():

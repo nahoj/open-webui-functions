@@ -118,49 +118,113 @@ class TestExportScheduler:
 def _make_action():
     """Build an Action without starting a real scheduler."""
     action = Action.__new__(Action)
-    action.valves = Action.Valves(EXPORT_INTERVAL_SECONDS=0)
+    action._valves = Action.Valves(EXPORT_INTERVAL_SECONDS=0)
     action._scheduler = ExportScheduler(action.valves)
     return action
 
 
 class TestAction:
     @pytest.mark.asyncio
-    async def test_action_run_now_triggers_export(self):
+    async def test_run_once_now_triggers_export(self):
         body = make_body()
         emitter = AsyncMock()
         action = _make_action()
 
-        with patch.object(action._scheduler, "run", return_value="success") as mock_run:
+        with patch.object(action._scheduler, "run_export_with_lock", return_value="success") as mock_run:
             result = await action.action(
                 body,
                 __user__=make_user(),
-                __id__="run_now",
+                __id__="run_once_now",
                 __event_emitter__=emitter,
             )
 
         assert result == body
         mock_run.assert_awaited_once()
         emitter.assert_awaited()
-        assert emitter.await_args.args[0]["data"]["description"] == "Auto-export completed."
+        assert emitter.await_args.args[0]["data"]["description"] == "Export completed."
         action._scheduler.shutdown()
 
     @pytest.mark.asyncio
-    async def test_action_run_now_reports_already_running(self):
+    async def test_run_once_now_reports_already_running(self):
         body = make_body()
         emitter = AsyncMock()
         action = _make_action()
 
-        with patch.object(action._scheduler, "run", return_value="skipped") as mock_run:
+        with patch.object(action._scheduler, "run_export_with_lock", return_value="skipped"):
             result = await action.action(
                 body,
                 __user__=make_user(),
-                __id__="run_now",
+                __id__="run_once_now",
                 __event_emitter__=emitter,
             )
 
         assert result == body
         emitter.assert_awaited()
-        assert emitter.await_args.args[0]["data"]["description"] == "Auto-export already running."
+        assert emitter.await_args.args[0]["data"]["description"] == "Export already running."
+        action._scheduler.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_start_background(self):
+        body = make_body()
+        emitter = AsyncMock()
+        action = _make_action()
+
+        result = await action.action(body, __user__=make_user(), __id__="enable_bg", __event_emitter__=emitter)
+
+        assert result == body
+        assert action._scheduler._scheduler.get_job(ExportScheduler._JOB_ID) is not None
+        assert "started" in emitter.await_args.args[0]["data"]["description"]
+        action._scheduler.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_start_background_already_running(self):
+        body = make_body()
+        emitter = AsyncMock()
+        action = _make_action()
+        action._scheduler.start_background()
+
+        result = await action.action(body, __user__=make_user(), __id__="enable_bg", __event_emitter__=emitter)
+
+        assert result == body
+        assert "already running" in emitter.await_args.args[0]["data"]["description"]
+        action._scheduler.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_stop_background(self):
+        body = make_body()
+        emitter = AsyncMock()
+        action = _make_action()
+        action._scheduler.start_background()
+
+        result = await action.action(body, __user__=make_user(), __id__="disable_bg", __event_emitter__=emitter)
+
+        assert result == body
+        assert action._scheduler._scheduler.get_job(ExportScheduler._JOB_ID) is None
+        assert "stopped" in emitter.await_args.args[0]["data"]["description"]
+        action._scheduler.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_stop_background_not_running(self):
+        body = make_body()
+        emitter = AsyncMock()
+        action = _make_action()
+
+        result = await action.action(body, __user__=make_user(), __id__="disable_bg", __event_emitter__=emitter)
+
+        assert result == body
+        assert "not running" in emitter.await_args.args[0]["data"]["description"]
+        action._scheduler.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_status(self):
+        body = make_body()
+        emitter = AsyncMock()
+        action = _make_action()
+
+        result = await action.action(body, __user__=make_user(), __id__="status", __event_emitter__=emitter)
+
+        assert result == body
+        assert "Background: off" in emitter.await_args.args[0]["data"]["description"]
         action._scheduler.shutdown()
 
     @pytest.mark.asyncio
@@ -172,7 +236,7 @@ class TestAction:
         result = await action.action(
             body,
             __user__={},
-            __id__="run_now",
+            __id__="export_once",
             __event_emitter__=emitter,
         )
 
