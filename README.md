@@ -15,3 +15,12 @@ A filter function that injects a system prompt into all conversations (similar t
 This prompt is added to the existing system prompt that contains model + folder + user or chat system prompt.
 
 **Example use case:** You want custom instructions to apply to all conversations for general-purpose assistant use, but you don't want them for roleplay. → Use the filter with `skip_tags` set to "character, roleplay" (and make sure your models are tagged appropriately).
+
+## Responses Pipe with Per-User Keys
+
+A Manifold pipe to connect to a Responses API, and allow users to supply their own API key instead of the default one set by the admin, via UserValves.
+
+Very limited implementation. Works with OpenAI, doesn't work with xAI, untested with other providers. For OpenAI, you may want to set in each model's custom parameters:
+- `reasoning → { "effort": "low" }` (for instance)
+- `tools → [{"type": "web_search"}]`
+- `include → ["web_search_call.action.sources"]`
