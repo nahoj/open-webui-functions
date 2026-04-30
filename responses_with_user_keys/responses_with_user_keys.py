@@ -5,7 +5,7 @@ author: Johan Grande
 repository: https://github.com/nahoj/open-webui-functions
 version: 0.3
 license: MIT
-description: Manifold pipe exposing an OpenAI-compatible Responses API endpoint where each user supplies their own API key via UserValves. Reuses Open WebUI's built-in payload conversion, header building, and SSE streaming helpers.
+description: A Manifold pipe to connect to a Responses API, and allow users to supply their own API key instead of the default one set by the admin, via UserValves. Reuses Open WebUI's built-in payload conversion, header building, and SSE streaming helpers.
 """
 
 from __future__ import annotations
