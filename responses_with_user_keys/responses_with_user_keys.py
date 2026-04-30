@@ -3,7 +3,7 @@ title: Responses API with Per-User Keys
 id: responses_with_user_keys
 author: Johan Grande
 repository: https://github.com/nahoj/open-webui-functions
-version: 0.1
+version: 0.2
 license: MIT
 description: Manifold pipe exposing an OpenAI-compatible Responses API endpoint where each user supplies their own API key via UserValves. Reuses Open WebUI's built-in payload conversion, header building, and SSE streaming helpers.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import aiohttp
@@ -40,13 +41,17 @@ class Pipe:
             default="https://api.openai.com/v1",
             description="OAI-compatible base URL (no trailing slash). Must speak the Responses API.",
         )
-        MODELS: str = Field(
-            default="gpt-5,gpt-4o,gpt-4o-mini",
-            description="Comma-separated list of upstream model IDs to expose as a manifold.",
-        )
-        FALLBACK_API_KEY: str = Field(
+        DEFAULT_API_KEY: str = Field(
             default="",
-            description="Optional admin fallback key used when a user has not set their own.",
+            description="Admin-side default API key. Used to fetch the model list at startup and as a fallback when a user hasn't set their own.",
+        )
+        MODEL_PREFIX: str = Field(
+            default="",
+            description="Optional prefix prepended to each model id in the picker (e.g. 'my' → 'my.gpt-5'). Leave empty for no prefix.",
+        )
+        MODEL_FILTER_REGEX: str = Field(
+            default=r"^(gpt-|chatgpt)",
+            description="Regex (re.search) used to filter the upstream /models list. Empty string = no filtering.",
         )
         REQUEST_TIMEOUT_S: int = Field(
             default=0,
@@ -66,18 +71,56 @@ class Pipe:
         self.id = "responses_with_user_keys"
         self.name = ""
 
-    def pipes(self) -> list[dict]:
-        models = [m.strip() for m in self.valves.MODELS.split(",") if m.strip()]
-        return [{"id": m, "name": m} for m in models]
+    async def pipes(self) -> list[dict]:
+        key = self.valves.DEFAULT_API_KEY
+        if not key:
+            self.logger.warning("DEFAULT_API_KEY is not set; no models will be listed.")
+            return []
+        ids = await self._fetch_models(key)
+        prefix = (self.valves.MODEL_PREFIX or "").strip(".")
+        if prefix:
+            return [{"id": f"{prefix}.{m}", "name": m} for m in ids]
+        return [{"id": m, "name": m} for m in ids]
+
+    async def _fetch_models(self, key: str) -> list[str]:
+        url = f"{self.valves.BASE_URL.rstrip('/')}/models"
+        headers = {"Authorization": f"Bearer {key}"}
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(trust_env=True) as sess:
+                async with sess.get(
+                    url, headers=headers, timeout=timeout, ssl=AIOHTTP_CLIENT_SESSION_SSL
+                ) as r:
+                    data = await r.json()
+        except Exception as e:
+            self.logger.error(f"Failed to fetch models from {url}: {e}")
+            return []
+
+        items = data.get("data", []) if isinstance(data, dict) else []
+        ids = [it["id"] for it in items if isinstance(it, dict) and it.get("id")]
+
+        pattern = self.valves.MODEL_FILTER_REGEX or ""
+        if pattern:
+            try:
+                rx = re.compile(pattern)
+                ids = [i for i in ids if rx.search(i)]
+            except re.error as e:
+                self.logger.error(f"Invalid MODEL_FILTER_REGEX {pattern!r}: {e}")
+        return sorted(ids)
 
     @staticmethod
     def _resolve_key(user_valves: Any, fallback: str) -> str:
         user_key = getattr(user_valves, "api_key", "") if user_valves is not None else ""
         return user_key or fallback
 
-    @staticmethod
-    def _strip_manifold_prefix(model_id: str) -> str:
-        return model_id.split(".", 1)[1] if "." in model_id else model_id
+    def _strip_prefixes(self, model_id: str) -> str:
+        # Strip manifold function_id ("responses_with_user_keys.").
+        s = model_id.split(".", 1)[1] if "." in model_id else model_id
+        # Strip the admin-configured prefix, if any.
+        prefix = (self.valves.MODEL_PREFIX or "").strip(".")
+        if prefix and s.startswith(f"{prefix}."):
+            s = s[len(prefix) + 1 :]
+        return s
 
     async def pipe(
         self,
@@ -86,7 +129,7 @@ class Pipe:
         __user__: Optional[dict] = None,
         __metadata__: Optional[dict] = None,
     ):
-        key = self._resolve_key((__user__ or {}).get("valves"), self.valves.FALLBACK_API_KEY)
+        key = self._resolve_key((__user__ or {}).get("valves"), self.valves.DEFAULT_API_KEY)
         if not key:
             return {
                 "error": {
@@ -97,12 +140,11 @@ class Pipe:
                 }
             }
 
-        body = {**body, "model": self._strip_manifold_prefix(body.get("model", ""))}
+        body = {**body, "model": self._strip_prefixes(body.get("model", ""))}
         url = self.valves.BASE_URL.rstrip("/")
         api_config = {"auth_type": "bearer"}
 
         payload = convert_to_responses_payload(body)
-        is_stream = bool(payload.get("stream"))
 
         headers, cookies = await get_headers_and_cookies(
             __request__, url, key, api_config, __metadata__, user=__user__
