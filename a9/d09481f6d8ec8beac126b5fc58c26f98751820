@@ -1,0 +1,40 @@
+openai_responses_filter/openai_responses_filter.py
+  s_11a3df0721f5b7::t_f153bdd5c42985 7
+  s_a286fb794588ec::t_9e6ee7f81a2395 42
+  s_a286fb794588ec::t_51ca7d4b1abb0b 52,66
+  s_a286fb794588ec::t_373f4f43503570 44-46
+  s_a286fb794588ec::t_b0e430a7f7c183 22-25
+  s_a286fb794588ec::t_6ff2aed5cd134d 1-6,8-10,12-21,26,28-34,36-41,43,47-51,58-63,65,67,77-100
+  s_a286fb794588ec::t_7797373714266a 68-76
+  s_11a3df0721f5b7::t_7646d32e048595 11
+  s_11a3df0721f5b7::t_b1098586e5caa7 53-57
+  s_a286fb794588ec::t_f3673ce195792e 27
+  s_a286fb794588ec::t_3e004b94d8dd57 35
+  s_a286fb794588ec::t_7d3186998cd47f 64
+effort_filter/effort_filter.py
+  s_11a3df0721f5b7::t_c4912700910404 1-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "a9d09481f6d8ec8beac126b5fc58c26f98751820",
+  "prompts": {},
+  "sessions": {
+    "s_11a3df0721f5b7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c30d15d-d7af-43e7-b8c2-4cc035d39209",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Johan Grande <nahoj+git@crans.org>"
+    },
+    "s_a286fb794588ec": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "f5d3db12-4632-4290-aa8d-db7ee3bce4b9",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Johan Grande <nahoj+git@crans.org>"
+    }
+  }
+}
